@@ -1,0 +1,182 @@
+use lazy_static::lazy_static;
+use nannou::{image::{DynamicImage, ImageBuffer}, prelude::*, wgpu::Texture};
+use rayon::prelude::*;
+use std::ops::Range;
+use fixed::types::I12F116;
+
+lazy_static! {
+    static ref RANGE_X: Range<I12F116> = I12F116::from_num(-2.00)..I12F116::from_num(0.47);
+    static ref RANGE_Y: Range<I12F116> = I12F116::from_num(-1.12)..I12F116::from_num(1.12);
+}
+
+struct Model {
+    dragging: bool,
+    mouse_pos0: Option<Point2>,
+    mouse_pos1: Option<Point2>,
+    invalid: bool,
+    iterations: u128,
+    running: bool,
+    offset: u128,
+    range_x: Range<I12F116>,
+    range_y: Range<I12F116>,
+}
+
+fn main() {
+    nannou::app(model).update(update).run();
+}
+
+fn model(app: &App) -> Model {
+    app.new_window()
+        .size(1200, 800)
+        .view(view)
+        .key_pressed(key_pressed)
+        .mouse_pressed(mouse_pressed)
+        .mouse_moved(mouse_moved)
+        .mouse_released(mouse_released)
+        .build()
+        .unwrap();
+    Model {
+        dragging: false,
+        invalid: true,
+        iterations: 0,
+        offset: 0,
+        running: true,
+        mouse_pos0: None,
+        mouse_pos1: None,
+        range_x: RANGE_X.clone(),
+        range_y: RANGE_Y.clone(),
+    }
+}
+
+fn key_pressed(_: &App, model: &mut Model, key: Key) {
+    match &key {
+        Key::R => {
+            model.offset = model.iterations;
+        },
+        Key::Space => {
+            model.running = !model.running;
+        }
+        _ => ()
+    }
+}
+
+fn mouse_pressed(app: &App, model: &mut Model, button: MouseButton) {
+    if button == MouseButton::Left {
+        model.dragging = true;
+        model.mouse_pos0 = app.mouse.position().into();
+        model.mouse_pos1 = model.mouse_pos0.clone();
+    }
+}
+
+fn mouse_moved(app: &App, model: &mut Model, pos: Point2) {
+    // model.mouse_pos1 = Some(pos);
+    if model.dragging {
+        // maintain same aspect ratio as window
+        let rect = app.window_rect();
+        let ratio = rect.h() / rect.w();
+        let wd = pos.x - model.mouse_pos0.unwrap().x;
+        let y = model.mouse_pos0.unwrap().y - wd * ratio;
+        model.mouse_pos1 = Some(Point2::new(pos.x, y));
+    }
+}
+
+fn mouse_released(app: &App, model: &mut Model, button: MouseButton) {
+    match &button {
+        MouseButton::Left => {
+            model.invalid = true;
+            model.dragging = false;
+
+            let rect = app.window_rect();
+            let pos0 = model.mouse_pos0.unwrap();
+            let pos1 = model.mouse_pos1.unwrap();
+            let x0 = map_range(pos0.x, rect.left(), rect.left() + rect.w(), model.range_x.start, model.range_x.end);
+            let x1 = map_range(pos1.x, rect.left(), rect.left() + rect.w(), model.range_x.start, model.range_x.end);
+            let y0 = map_range(pos0.y, rect.top(), rect.top() - rect.h(), model.range_y.start, model.range_y.end);
+            let y1 = map_range(pos1.y, rect.top(), rect.top() - rect.h(), model.range_y.start, model.range_y.end);
+            model.range_x = if x0 < x1 { x0..x1 } else { x1..x0 };
+            model.range_y = if y0 < y1 { y0..y1 } else { y1..y0 };
+            // model.offset = model.iterations;
+        }
+        MouseButton::Right => {
+            model.offset = model.iterations;
+            model.range_x = RANGE_X.clone();
+            model.range_y = RANGE_Y.clone();
+            model.invalid = true;
+        },
+        _ => ()
+    }
+}
+
+fn update(_: &App, model: &mut Model, update: Update) {
+    let d = update.since_start.as_millis() / 50;
+    if model.invalid {
+        model.invalid = false; 
+    }
+    if d != model.iterations {
+        model.invalid = true;
+        model.iterations = d;
+        // if !model.running {
+        //     model.offset += d;
+        // }
+    }
+}
+
+fn view(app: &App, model: &Model, frame: Frame) {
+    if !(model.invalid || model.dragging) { return }
+    let draw = app.draw();
+    let width = app.window_rect().w() as u32;
+    let height = app.window_rect().h() as u32;
+    let len = width * height;
+    let iterations = model.iterations - model.offset;
+    let buf: Vec<u8> = (0..len)
+        .into_par_iter()
+        .map(|i| map_color(get_raw_val(i, width, height, iterations, &model.range_x, &model.range_y)))
+        .collect();
+    let img = ImageBuffer::from_vec(width, height, buf).unwrap();
+    let view = Texture::from_image(app, &DynamicImage::ImageLuma8(img));
+    draw.background().color(BLACK);
+    draw.texture(&view);
+
+    if model.dragging {
+        let pos0 = model.mouse_pos0.unwrap();
+        let pos1 = model.mouse_pos1.unwrap();
+        draw.line().weight(1.0).color(GREEN).points(pos0, Point2::new(pos0.x, pos1.y));
+        draw.line().weight(1.0).color(GREEN).points(Point2::new(pos0.x, pos1.y), pos1);
+        draw.line().weight(1.0).color(GREEN).points(pos1, Point2::new(pos1.x, pos0.y));
+        draw.line().weight(1.0).color(GREEN).points(Point2::new(pos1.x, pos0.y), pos0);
+    }
+
+    draw.to_frame(app, &frame).unwrap();
+}
+
+// #[inline]
+fn get_raw_val(i: u32, w: u32, h: u32, n: u128, rx: &Range<I12F116>, ry: &Range<I12F116>) -> f64 {
+    let x0 = map_range((i % w) as f32, 0.0, w as f32, rx.start, rx.end);
+    let y0 = map_range((i / w) as f32, 0.0, h as f32, ry.start, ry.end);
+    let two = I12F116::from_num(2);
+    let mut x2 = I12F116::ZERO;
+    let mut y2 = I12F116::ZERO;
+    let mut x = I12F116::ZERO;
+    let mut y = I12F116::ZERO;
+    let mut j = 0;
+    while x2 + y2 <= 4.0 && j < n {
+        y = two * x * y + y0;
+        x = x2 - y2 + x0;
+        x2 = x * x;
+        y2 = y * y;
+        j += 1;
+    }
+    j as f64 / n as f64
+}
+
+// #[inline]
+fn map_range(val: f32, in_min: f32, in_max: f32, out_min: I12F116, out_max: I12F116) -> I12F116 {
+    let lhs = I12F116::from_num(val - in_min);
+    let rhs = I12F116::from_num(in_max - in_min);
+    lhs / rhs * (out_max - out_min) + out_min
+}
+
+// #[inline]
+fn map_color(value: f64) -> u8 {
+    u8::MAX - (value * 255.0) as u8
+}
